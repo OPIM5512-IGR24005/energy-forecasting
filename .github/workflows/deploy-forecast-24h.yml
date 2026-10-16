@@ -32,6 +32,8 @@ env:
 
 jobs:
   deploy:
+    # Deploys only from YOUR fork (the course repo has no Google Cloud project behind it)
+    if: github.repository_owner != 'drdave-teaching'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
