@@ -28,10 +28,19 @@ it, or **Actions → Run workflow**). Get course updates with **Sync fork → Up
 
 ## Train and ship a model
 **[Lab 5 notebook](https://github.com/drdave-teaching/OPIM5512-notebooks/blob/main/Module4/Lab5_Energy_Forecast_In_Production.ipynb)**:
-three years of Bradley weather + Connecticut load ([how it was built](https://github.com/drdave-teaching/OPIM5512-notebooks/blob/main/Module4/Lab5_Building_the_Training_Data.ipynb)),
+Bradley weather + Connecticut load from Jan 2023 to Oct 2026 ([how it was built](https://github.com/drdave-teaching/OPIM5512-notebooks/blob/main/Module4/Lab5_Building_the_Training_Data.ipynb)),
 baselines, time-series cross-validation, a tuned model, then upload to `energy/models/model.joblib`.
 `forecast-24h` builds its inputs with the same `make_features` function as the notebook, so any scikit-learn model
 trained on those 11 features works.
+
+**Just want a working model right now?** In Cloud Shell, from your fork:
+```bash
+python3 -m venv ~/energy-venv && ~/energy-venv/bin/pip install -q -r starter/requirements.txt
+~/energy-venv/bin/python starter/train_and_ship.py --project YOUR-ENERGY-PROJECT-ID --bucket YOUR-BUCKET
+gcloud scheduler jobs run forecast-24h-hourly --location=us-central1
+```
+It trains gradient boosting with the Lab 5 champion settings (about 120 MW average error on 2026, vs 266 MW for "same hour
+yesterday") and uploads it; your next 24 hours appear in `energy/forecasts/latest.csv`.
 
 ## Data credits
 Weather: Iowa State Mesonet (mesonet.agron.iastate.edu) and the National Weather Service. Load and forecasts: ISO New
