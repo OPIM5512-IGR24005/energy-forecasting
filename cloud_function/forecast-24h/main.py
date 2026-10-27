@@ -6,7 +6,11 @@
 #   3. builds the features with make_features(), the SAME code as the Lab 5 notebook:
 #        weather  -> the newest NWS forecast for each hour (bdl_weather_forecast_master.csv)
 #        load     -> the load at the same hour yesterday (ct_load_5min_hourly_master.csv, live five-minute load)
-#   4. writes 24 rows (target_hour_utc, predicted_load_mw, ...):
+#   4. adds a low and high value (an 80% range: 10th and 90th percentiles) if your model card says how (Lab 6):
+#        "range_method": "quantile_models"  -> two more models, energy/models/model_low.joblib and model_high.joblib
+#        "range_method": "offsets_by_hour"  -> "range_offsets_mw": {"low": [24 MW], "high": [24 MW]}, by Connecticut hour
+#        no "range_method" (Lab 5)          -> expected value only (the low and high columns stay empty)
+#   5. writes 24 rows (target_hour_utc, predicted_low_mw, predicted_load_mw, predicted_high_mw, ...):
 #        gs://<bucket>/energy/forecasts/latest.csv                       <- replaced every hour (Lab 6 reads this one)
 #        gs://<bucket>/energy/forecasts/history/<issued time>.csv        <- one file per hour, never overwritten
 #        gs://<bucket>/energy/datasets/forecasts_master.csv              <- every forecast you ever made, in one table
@@ -33,6 +37,8 @@ HOURS_AHEAD = int(os.getenv("HOURS_AHEAD", "24"))
 
 MODEL_KEY = f"{ENERGY_PREFIX}/models/model.joblib"
 CARD_KEY = f"{ENERGY_PREFIX}/models/model_card.json"
+LOW_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_low.joblib"
+HIGH_MODEL_KEY = f"{ENERGY_PREFIX}/models/model_high.joblib"
 WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
 LOAD_KEY = f"{ENERGY_PREFIX}/datasets/ct_load_5min_hourly_master.csv"
 LATEST_KEY = f"{ENERGY_PREFIX}/forecasts/latest.csv"
@@ -91,6 +97,38 @@ def latest_weather(forecasts: pd.DataFrame) -> pd.DataFrame:
     return newest
 
 
+def forecast_range(bucket, card, X, preds, targets):
+    """The low and high ends of your 80% range for each hour, plus how they were made.
+    Returns (low, high, method), or (None, None, "none") when your model card asks for no range."""
+    method = str(card.get("range_method", "none"))
+    if method == "quantile_models":
+        if not bucket.blob(LOW_MODEL_KEY).exists() or not bucket.blob(HIGH_MODEL_KEY).exists():
+            raise ValueError("Your model card says quantile_models, but model_low.joblib or model_high.joblib is missing.")
+        low_model = joblib.load(io.BytesIO(bucket.blob(LOW_MODEL_KEY).download_as_bytes()))
+        high_model = joblib.load(io.BytesIO(bucket.blob(HIGH_MODEL_KEY).download_as_bytes()))
+        low = low_model.predict(X[FEATURES])
+        high = high_model.predict(X[FEATURES])
+    elif method == "offsets_by_hour":
+        offsets = card["range_offsets_mw"]
+        if len(offsets["low"]) != 24 or len(offsets["high"]) != 24:
+            raise ValueError("range_offsets_mw needs 24 low and 24 high offsets, one per Connecticut hour (0 = midnight).")
+        local_hours = pd.DatetimeIndex(targets).tz_convert("America/New_York").hour
+        low = preds + np.array(offsets["low"], dtype=float)[local_hours]
+        high = preds + np.array(offsets["high"], dtype=float)[local_hours]
+    else:
+        return None, None, "none"
+
+    # "range_widen": 1.3 stretches the range 30% around the expected value, no retraining (Lab 6: if the leaderboard
+    # says only 65% of actual loads landed inside your 80% range, your range is too narrow)
+    widen = float(card.get("range_widen", 1.0))
+    low = preds - widen * (preds - low)
+    high = preds + widen * (high - preds)
+    # The expected value always sits inside its own range
+    low = np.minimum(low, preds)
+    high = np.maximum(high, preds)
+    return low, high, method
+
+
 def run_once(dry_run: bool = False) -> dict:
     bucket = storage.Client(project=PROJECT_ID).bucket(GCS_BUCKET)
     if not bucket.blob(MODEL_KEY).exists():
@@ -126,14 +164,29 @@ def run_once(dry_run: bool = False) -> dict:
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
 
     preds = model.predict(X[FEATURES])
+    range_error = ""
+    try:                         # a broken range never costs you your expected-value forecast
+        low, high, range_method = forecast_range(bucket, card, X, preds, targets)
+    except Exception as err:
+        low, high, range_method = None, None, "error"
+        range_error = str(err)[:300]
+    if low is None:
+        low = np.full(len(preds), np.nan)
+        high = np.full(len(preds), np.nan)
     out = pd.DataFrame({"issued_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "target_hour_utc": targets.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "lead_hours": np.arange(1, HOURS_AHEAD + 1),
+                        "predicted_low_mw": np.round(low, 1),
                         "predicted_load_mw": np.round(preds, 1),
-                        "model_version": model_version})
+                        "predicted_high_mw": np.round(high, 1),
+                        "model_version": model_version,
+                        "range_method": range_method})
     summary = {"status": "ok", "model_version": model_version, "first_target_utc": out["target_hour_utc"].iloc[0],
                "last_target_utc": out["target_hour_utc"].iloc[-1], "newest_load_hour_utc": load.index.max().isoformat(),
                "min_mw": float(out["predicted_load_mw"].min()), "max_mw": float(out["predicted_load_mw"].max()),
+               "range_method": range_method,
+               "avg_range_width_mw": None if low is None or np.isnan(low).all() else round(float(np.mean(high - low)), 1),
+               "range_error": range_error,
                "filled_weather_values": filled_weather, "filled_load_values": filled_load}
     if dry_run:
         summary["dry_run"] = True
