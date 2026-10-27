@@ -78,7 +78,7 @@ jobs:
           PY
           SA_ARGS=()
           if [[ -n "${RUNTIME_SA:-}" ]]; then
-            gcloud iam service-accounts describe "${RUNTIME_SA}" >/dev/null 2>&1
+            gcloud iam service-accounts describe "${RUNTIME_SA}"
             SA_ARGS=(--service-account="${RUNTIME_SA}")
           fi
 
