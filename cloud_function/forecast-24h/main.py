@@ -52,7 +52,22 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 # ----------------------------------------------------------------------------------------------------------------
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
-FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"]
+SOLAR = ["sun_elev_deg", "solar_x_clear"]                       # NEW: rooftop solar (from the clock + cloud cover)
+FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"] + SOLAR  # the 13 columns, in the order the model expects
+
+BDL_LAT, BDL_LON = 41.94, -72.68                               # Bradley Airport
+
+
+def sun_elevation(hours_utc):
+    """How high the sun is over Bradley (degrees, 0 at night), at the middle of each hour. Math only, no data."""
+    mid = pd.DatetimeIndex(hours_utc) + pd.Timedelta(minutes=30)
+    day = mid.dayofyear.values
+    hour_utc = mid.hour.values + mid.minute.values / 60
+    lat = np.radians(BDL_LAT)
+    declination = np.radians(23.44) * np.sin(2 * np.pi * (284 + day) / 365)
+    hour_angle = np.radians(15 * (hour_utc + BDL_LON / 15 - 12))
+    sin_elev = np.sin(lat) * np.sin(declination) + np.cos(lat) * np.cos(declination) * np.cos(hour_angle)
+    return np.clip(np.degrees(np.arcsin(sin_elev)), 0, None)
 
 
 def make_features(hours_utc, weather, load):
@@ -61,22 +76,28 @@ def make_features(hours_utc, weather, load):
     load: Connecticut load in MW, indexed by UTC hour (only hours that are already over)."""
     hours_utc = pd.DatetimeIndex(hours_utc)
     local = hours_utc.tz_convert("America/New_York")           # people use electricity on local time
-    out = pd.DataFrame(index=hours_utc)
-    out["hour"] = local.hour
+    out = pd.DataFrame(index=hours_utc)                        # one row per hour, still keyed by UTC
+
+    # 1. Calendar: 5 columns, all on Connecticut time
+    out["hour"] = local.hour                                   # 0 ... 23
     out["day_of_week"] = local.dayofweek                       # 0 = Monday ... 6 = Sunday
-    out["month"] = local.month
-    out["is_weekend"] = (local.dayofweek >= 5).astype(int)
+    out["month"] = local.month                                 # 1 ... 12
+    out["is_weekend"] = (local.dayofweek >= 5).astype(int)     # 1 on Saturday and Sunday
     holidays = USFederalHolidayCalendar().holidays(start="2020-01-01", end="2030-12-31")
     out["is_holiday"] = local.tz_localize(None).normalize().isin(holidays).astype(int)
 
+    # 2. Weather: 5 columns, looked up hour by hour (in the notebook: what happened; in production: the NWS forecast)
     for column in WEATHER:
         out[column] = weather[column].reindex(hours_utc).values
 
-    # Same hour yesterday. If that hour isn't over yet (only the last hour of a live forecast),
-    # use the hour just before it.
+    # 3. Load yesterday: same hour 24 hours earlier; if that hour isn't over yet, the hour before it (25 hours)
     yesterday = load.reindex(hours_utc - pd.Timedelta(hours=24)).values
     hour_before = load.reindex(hours_utc - pd.Timedelta(hours=25)).values
     out["load_yesterday_mw"] = np.where(np.isnan(yesterday), hour_before, yesterday)
+
+    # 4. NEW, rooftop solar: the grid load drops when the sun is high and the sky is clear
+    out["sun_elev_deg"] = sun_elevation(hours_utc)
+    out["solar_x_clear"] = np.sin(np.radians(out["sun_elev_deg"])) * (100 - out["cloud_cover_pct"])
     return out[FEATURES]
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -106,8 +127,8 @@ def forecast_range(bucket, card, X, preds, targets):
             raise ValueError("Your model card says quantile_models, but model_low.joblib or model_high.joblib is missing.")
         low_model = joblib.load(io.BytesIO(bucket.blob(LOW_MODEL_KEY).download_as_bytes()))
         high_model = joblib.load(io.BytesIO(bucket.blob(HIGH_MODEL_KEY).download_as_bytes()))
-        low = low_model.predict(X[FEATURES])
-        high = high_model.predict(X[FEATURES])
+        low = low_model.predict(X[list(getattr(low_model, 'feature_names_in_', FEATURES))])
+        high = high_model.predict(X[list(getattr(high_model, 'feature_names_in_', FEATURES))])
     elif method == "offsets_by_hour":
         offsets = card["range_offsets_mw"]
         if len(offsets["low"]) != 24 or len(offsets["high"]) != 24:
@@ -158,12 +179,13 @@ def run_once(dry_run: bool = False) -> dict:
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing yesterday load takes the newest load
     filled_weather = int(X[WEATHER].isna().sum().sum())
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
+    X["solar_x_clear"] = np.sin(np.radians(X["sun_elev_deg"])) * (100 - X["cloud_cover_pct"])
     filled_load = int(X["load_yesterday_mw"].isna().sum())
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     if X[WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
 
-    preds = model.predict(X[FEATURES])
+    preds = model.predict(X[list(getattr(model, 'feature_names_in_', FEATURES))])
     range_error = ""
     try:                         # a broken range never costs you your expected-value forecast
         low, high, range_method = forecast_range(bucket, card, X, preds, targets)
