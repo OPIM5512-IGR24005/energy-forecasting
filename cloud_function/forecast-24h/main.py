@@ -103,10 +103,15 @@ def make_features(hours_utc, weather, load):
     for column in WEATHER:
         out[column] = weather[column].reindex(hours_utc).values
 
-    # 3. Load yesterday: same hour 24 hours earlier; if that hour isn't over yet, the hour before it (25 hours)
+    # 3. Load yesterday: same hour 24 hours earlier.
+    #    If that hour isn't over yet (24 hours ahead), use the hour before it (25 hours)
+    #    plus how much the load changed in that same step two days ago (48h minus 49h).
     yesterday = load.reindex(hours_utc - pd.Timedelta(hours=24)).values
     hour_before = load.reindex(hours_utc - pd.Timedelta(hours=25)).values
-    out["load_yesterday_mw"] = np.where(np.isnan(yesterday), hour_before, yesterday)
+    step = (load.reindex(hours_utc - pd.Timedelta(hours=48)).values
+            - load.reindex(hours_utc - pd.Timedelta(hours=49)).values)
+    fallback = np.where(np.isnan(step), hour_before, hour_before + step)
+    out["load_yesterday_mw"] = np.where(np.isnan(yesterday), fallback, yesterday)
 
     # 4. NEW, rooftop solar: the grid load drops when the sun is high and the sky is clear
     out["sun_elev_deg"] = sun_elevation(hours_utc)
