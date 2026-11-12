@@ -64,7 +64,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
 SOLAR = ["sun_elev_deg", "solar_x_clear"]                       # NEW: rooftop solar (from the clock + cloud cover)
-FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"] + SOLAR  # the 13 columns, in the order the model expects
+COAST = ["coast_temp", "coast_dew", "coast_cloud"]              # NEW: average of Bridgeport, New Haven, Groton
+COAST_FROM = {"coast_temp": "temp_f", "coast_dew": "dewpoint_f", "coast_cloud": "cloud_cover_pct"}
+FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"] + SOLAR + COAST  # 16 columns; each model uses its own (cols_for)
 
 BDL_LAT, BDL_LON = 41.94, -72.68                               # Bradley Airport
 
@@ -109,7 +111,40 @@ def make_features(hours_utc, weather, load):
     # 4. NEW, rooftop solar: the grid load drops when the sun is high and the sky is clear
     out["sun_elev_deg"] = sun_elevation(hours_utc)
     out["solar_x_clear"] = np.sin(np.radians(out["sun_elev_deg"])) * (100 - out["cloud_cover_pct"])
+
+    # 5. NEW, coastal weather: where most people live (empty when the weather table has no coastal columns)
+    for column in COAST:
+        out[column] = weather[column].reindex(hours_utc).values if column in weather.columns else np.nan
     return out[FEATURES]
+
+
+COAST_KEY = os.getenv("COAST_KEY", "energy/datasets/coast_weather_forecast_master.csv")
+
+
+def coastal_weather(bucket, now):
+    """Tomato: the newest NWS forecast for each coastal airport, averaged over the airports, by UTC target hour.
+    Empty table if the coastal file is missing (the Bradley values are then used, see fill_coast)."""
+    try:
+        if not bucket.blob(COAST_KEY).exists():
+            return pd.DataFrame()
+        c = pd.read_csv(io.BytesIO(bucket.blob(COAST_KEY).download_as_bytes()))
+        c["scraped_hour_utc"] = pd.to_datetime(c["scraped_hour_utc"], utc=True)
+        c["target_hour_utc"] = pd.to_datetime(c["target_hour_utc"], utc=True)
+        c = c[c["scraped_hour_utc"] <= pd.Timestamp(now)]
+        c = c.sort_values("scraped_hour_utc").drop_duplicates(["station", "target_hour_utc"], keep="last")
+        avg = c.groupby("target_hour_utc")[["temp_f", "dewpoint_f", "cloud_cover_pct"]].mean()
+        return pd.DataFrame({"coast_temp": avg["temp_f"], "coast_dew": avg["dewpoint_f"], "coast_cloud": avg["cloud_cover_pct"]})
+    except Exception as err:
+        logging.warning("Coastal forecast not used: %s", err)
+        return pd.DataFrame()
+
+
+def fill_coast(X):
+    """Tomato: a missing coastal value takes its neighbor; if still missing, Bradley's value for that hour."""
+    for column in COAST:
+        X[column] = X[column].interpolate(limit_direction="both")
+        X[column] = X[column].fillna(X[COAST_FROM[column]])
+    return X
 
 
 def cols_for(model):
@@ -171,7 +206,7 @@ def fill_inputs(X, load):
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     X["solar_x_clear"] = np.sin(np.radians(X["sun_elev_deg"])) * (100 - X["cloud_cover_pct"])   # Tomato
-    return X
+    return fill_coast(X)
 
 
 def hrrr_run_tables(card, now):
@@ -271,6 +306,9 @@ def run_once(dry_run: bool = False) -> dict:
     this_hour = pd.Timestamp(now).floor("h")
     targets = pd.date_range(this_hour + pd.Timedelta(hours=1), periods=HOURS_AHEAD, freq="h")
     weather = latest_weather(forecasts)
+    coast = coastal_weather(bucket, now)                       # Tomato
+    if len(coast) > 0:
+        weather = weather.join(coast, how="left")
     X = make_features(targets, weather, load)
 
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing yesterday load takes the newest load
@@ -279,6 +317,8 @@ def run_once(dry_run: bool = False) -> dict:
     filled_load = int(X["load_yesterday_mw"].isna().sum())
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     X["solar_x_clear"] = np.sin(np.radians(X["sun_elev_deg"])) * (100 - X["cloud_cover_pct"])   # Tomato
+    coast_values_used = int(X[COAST].notna().all(axis=1).sum())                                    # Tomato
+    X = fill_coast(X)
     if X[WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
 
@@ -319,7 +359,8 @@ def run_once(dry_run: bool = False) -> dict:
                "range_method": range_method,
                "avg_range_width_mw": None if low is None or np.isnan(low).all() else round(float(np.mean(high - low)), 1),
                "range_error": range_error,
-               "filled_weather_values": filled_weather, "filled_load_values": filled_load}
+               "filled_weather_values": filled_weather, "filled_load_values": filled_load,
+               "coast_hours_from_forecast": coast_values_used}
     summary.update(pool_info)
     if dry_run:
         summary["dry_run"] = True

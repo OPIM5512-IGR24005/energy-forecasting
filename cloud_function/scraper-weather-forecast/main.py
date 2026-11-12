@@ -32,6 +32,11 @@ MAX_LEAD = int(os.getenv("MAX_LEAD_HOURS", "24"))
 USER_AGENT = os.getenv("USER_AGENT", "OPIM5512-student-scraper (UConn)")
 
 MASTER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
+# Tomato: the same NWS forecast for 3 coastal airports, where most of Connecticut lives (own file, Bradley untouched)
+COAST_STATIONS = {"BDR": ("41.1635", "-73.1262"),   # Bridgeport
+                  "HVN": ("41.2637", "-72.8868"),   # New Haven
+                  "GON": ("41.3297", "-72.0451")}   # Groton / New London
+COAST_MASTER_KEY = f"{ENERGY_PREFIX}/datasets/coast_weather_forecast_master.csv"
 # (DWML tag, its "type" attribute) -> our column name; units: F, %, mph, degrees, inches
 FIELDS = {("temperature", "hourly"): "temp_f", ("temperature", "dew point"): "dewpoint_f",
           ("humidity", "relative"): "rel_humidity_pct", ("wind-speed", "sustained"): "wind_speed_mph",
@@ -42,8 +47,8 @@ FIELDS = {("temperature", "hourly"): "temp_f", ("temperature", "dew point"): "de
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
 
-def download_forecast() -> str:
-    url = f"https://forecast.weather.gov/MapClick.php?lat={LAT}&lon={LON}&FcstType=digitalDWML"
+def download_forecast(lat=LAT, lon=LON) -> str:
+    url = f"https://forecast.weather.gov/MapClick.php?lat={lat}&lon={lon}&FcstType=digitalDWML"
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
     r.raise_for_status()
     return r.text
@@ -97,8 +102,42 @@ def run_once(dry_run: bool = False) -> dict:
         master = keep
     master = master.sort_values(["scraped_hour_utc", "target_hour_utc"])
     bucket.blob(MASTER_KEY).upload_from_string(master.to_csv(index=False), content_type="text/csv")
+    coast = scrape_coast(bucket, scraped_hour)          # Tomato: never stops the Bradley forecast above
     return {"status": "ok", "issued_at_utc": issued.isoformat(), "rows_this_run": int(len(keep)),
-            "scrape_hours_in_master": int(master["scraped_hour_utc"].nunique()), "master_key": MASTER_KEY}
+            "scrape_hours_in_master": int(master["scraped_hour_utc"].nunique()), "master_key": MASTER_KEY,
+            "coast": coast}
+
+
+def scrape_coast(bucket, scraped_hour) -> dict:
+    """Tomato: download the NWS forecast for each coastal airport and append to its own master file.
+    Any problem is logged and skipped, so Bradley's forecast (already saved) is never affected."""
+    parts, done = [], []
+    for station, (lat, lon) in COAST_STATIONS.items():
+        try:
+            issued, table = parse_forecast(download_forecast(lat, lon))
+            keep = table[(table.index >= scraped_hour) & (table.index <= scraped_hour + pd.Timedelta(hours=MAX_LEAD))].copy()
+            keep["lead_hours"] = ((keep.index - scraped_hour) / pd.Timedelta(hours=1)).astype(int)
+            keep["scraped_hour_utc"] = scraped_hour
+            keep["issued_at_utc"] = issued
+            keep["station"] = station
+            parts.append(keep.reset_index())
+            done.append(station)
+        except Exception as err:
+            logging.warning("Coastal forecast %s failed: %s", station, err)
+    if len(parts) == 0:
+        return {"stations": []}
+    try:
+        new = pd.concat(parts, ignore_index=True)
+        blob = bucket.blob(COAST_MASTER_KEY)
+        if blob.exists():
+            old = pd.read_csv(io.BytesIO(blob.download_as_bytes()), parse_dates=["scraped_hour_utc", "issued_at_utc", "target_hour_utc"])
+            new = pd.concat([old, new], ignore_index=True).drop_duplicates(["station", "scraped_hour_utc", "target_hour_utc"], keep="last")
+        new = new.sort_values(["scraped_hour_utc", "station", "target_hour_utc"])
+        blob.upload_from_string(new.to_csv(index=False), content_type="text/csv")
+    except Exception as err:
+        logging.warning("Coastal master not saved: %s", err)
+        return {"stations": done, "saved": False}
+    return {"stations": done, "saved": True, "rows": int(len(new))}
 
 
 def scrape_weather_forecast_http(request):
