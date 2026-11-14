@@ -66,7 +66,8 @@ CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
 SOLAR = ["sun_elev_deg", "solar_x_clear"]                       # NEW: rooftop solar (from the clock + cloud cover)
 COAST = ["coast_temp", "coast_dew", "coast_cloud"]              # NEW: average of Bridgeport, New Haven, Groton
 COAST_FROM = {"coast_temp": "temp_f", "coast_dew": "dewpoint_f", "coast_cloud": "cloud_cover_pct"}
-FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"] + SOLAR + COAST  # 16 columns; each model uses its own (cols_for)
+HEAT = ["temp_avg_24h"]                                        # NEW v6: how cold it has been over the past day
+FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"] + SOLAR + COAST + HEAT  # 17 columns; each model uses its own (cols_for)
 
 BDL_LAT, BDL_LON = 41.94, -72.68                               # Bradley Airport
 
@@ -120,6 +121,12 @@ def make_features(hours_utc, weather, load):
     # 5. NEW, coastal weather: where most people live (empty when the weather table has no coastal columns)
     for column in COAST:
         out[column] = weather[column].reindex(hours_utc).values if column in weather.columns else np.nan
+
+    # 6. NEW v6, heat comes on late: the average temperature over the 24 hours up to each hour
+    #    (heating is switched on after it has been cold for a while: landlords, space heaters)
+    full = pd.date_range(hours_utc.min() - pd.Timedelta(hours=23), hours_utc.max(), freq="h")
+    temps = weather["temp_f"].reindex(full).interpolate(limit_direction="both")
+    out["temp_avg_24h"] = temps.rolling(24, min_periods=12).mean().reindex(hours_utc).values
     return out[FEATURES]
 
 
@@ -211,6 +218,7 @@ def fill_inputs(X, load):
     X[WEATHER] = X[WEATHER].interpolate(limit_direction="both")
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     X["solar_x_clear"] = np.sin(np.radians(X["sun_elev_deg"])) * (100 - X["cloud_cover_pct"])   # Tomato
+    X["temp_avg_24h"] = X["temp_avg_24h"].fillna(X["temp_f"])                                       # Tomato v6
     return fill_coast(X)
 
 
@@ -324,6 +332,7 @@ def run_once(dry_run: bool = False) -> dict:
     X["solar_x_clear"] = np.sin(np.radians(X["sun_elev_deg"])) * (100 - X["cloud_cover_pct"])   # Tomato
     coast_values_used = int(X[COAST].notna().all(axis=1).sum())                                    # Tomato
     X = fill_coast(X)
+    X["temp_avg_24h"] = X["temp_avg_24h"].fillna(X["temp_f"])                                       # Tomato v6
     if X[WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
 
