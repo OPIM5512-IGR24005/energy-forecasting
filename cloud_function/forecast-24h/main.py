@@ -9,6 +9,9 @@
 #   4. adds a low and high value (an 80% range: 10th and 90th percentiles) if your model card says how (Lab 6):
 #        "range_method": "quantile_models"  -> two more models, energy/models/model_low.joblib and model_high.joblib
 #        "range_method": "offsets_by_hour"  -> "range_offsets_mw": {"low": [24 MW], "high": [24 MW]}, by Connecticut hour
+#        "range_method": "range_model"      -> Final project: ONE model, energy/models/model_qrf.joblib, fed the NWS
+#                                              forecast only. model.predict(X) returns 3 columns: low, expected, high.
+#                                              Tomato: tomato_range.ThreeQuantileBoost (needs tomato_range.py next to main.py)
 #        "range_method": "hrrr_qrf_pooled"  -> Lab 6C: energy/models/model_qrf.joblib (a quantile forest) on EVERY recent HRRR
 #                                              run that covers each hour (weather uncertainty), pooled into one low,
 #                                              expected and high. HRRR runs come from Dr. Dave's class file (HRRR_RUNS_URL);
@@ -242,6 +245,25 @@ def hrrr_run_tables(card, now):
     return tables
 
 
+def forest_range(bucket, card, X):
+    """Final project (Dr. Dave's range_model): ONE model on the NWS forecast only. If model.predict(X) gives 3 columns,
+    they are low, expected and high; otherwise the model is a quantile forest asked for its 10th, 50th and 90th
+    percentiles. Rows are sorted, then range_widen stretches low and high around the expected value. Tomato: the model
+    gets exactly the columns it was trained on (cols_for)."""
+    if not bucket.blob(QRF_MODEL_KEY).exists():
+        raise ValueError("Your model card says " + str(card.get("range_method")) + ", but energy/models/model_qrf.joblib is missing.")
+    model = joblib.load(io.BytesIO(bucket.blob(QRF_MODEL_KEY).download_as_bytes()))
+    q = np.asarray(model.predict(X[cols_for(model)]), dtype=float)
+    if q.ndim != 2 or q.shape[1] != 3:
+        q = np.asarray(model.predict(X[cols_for(model)], quantiles=[0.1, 0.5, 0.9]), dtype=float)
+    q = np.sort(q, axis=1)
+    low, expected, high = q[:, 0], q[:, 1], q[:, 2]
+    widen = float(card.get("range_widen", 1.0))
+    low = expected - widen * (expected - low)
+    high = expected + widen * (high - expected)
+    return low, expected, high
+
+
 def pooled_range(bucket, card, targets, load, nws_weather, now):
     """Lab 6C: the quantile forest's 20 percentiles (2.5%, 7.5%, ..., 97.5%) for every HRRR run that covers an hour, pooled
     into one pile per hour; low, expected and high are the 10th, 50th and 90th percentile of the pile ("hazen": each
@@ -340,7 +362,11 @@ def run_once(dry_run: bool = False) -> dict:
     range_error = ""
     pool_info = {}
     try:                         # a broken range never costs you your expected-value forecast
-        if str(card.get("range_method", "none")) == "hrrr_qrf_pooled":
+        if str(card.get("range_method", "none")) in ["range_model", "quantile_forest"]:     # final project
+            low, model_expected, high = forest_range(bucket, card, X)
+            preds = model_expected             # the expected value is the model's middle column
+            range_method = str(card.get("range_method"))
+        elif str(card.get("range_method", "none")) == "hrrr_qrf_pooled":
             low, pooled_expected, high, pool_info = pooled_range(bucket, card, targets, load, weather, now)
             if bool(card.get("center_on_lab5_model", False)):
                 # Tomato option: keep the Lab 5 model's expected value and move the pooled range to sit around it
