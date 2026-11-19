@@ -261,6 +261,15 @@ def forest_range(bucket, card, X):
     widen = float(card.get("range_widen", 1.0))
     low = expected - widen * (expected - low)
     high = expected + widen * (high - expected)
+    # Tomato (Nov 19): sunny/cloudy daylight correction, learned from the live NWS forecasts Nov 2-16 and checked on
+    # Nov 17-19. Rooftop solar has grown since the training years, so on clear days the model forecasts daytime load
+    # too high and on cloudy days a bit too low. card "solar_fix": [per unit of clear sun, per unit of clouded sun] (MW).
+    fix = card.get("solar_fix")
+    if fix:
+        sun = np.sin(np.radians(np.clip(X["sun_elev_deg"].values.astype(float), 0, None))) * 100.0
+        clear = sun * (100.0 - X["cloud_cover_pct"].values.astype(float)) / 100.0
+        shift = float(fix[0]) * clear + float(fix[1]) * (sun - clear)
+        low, expected, high = low - shift, expected - shift, high - shift
     return low, expected, high
 
 
