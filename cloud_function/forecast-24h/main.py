@@ -275,6 +275,11 @@ def forest_range(bucket, card, X):
         clear = sun * (100.0 - X["cloud_cover_pct"].values.astype(float)) / 100.0
         shift = float(fix[0]) * clear + float(fix[1]) * (sun - clear)
         low, expected, high = low - shift, expected - shift, high - shift
+    # Tomato (Nov 26): level correction. On the live NWS forecasts Nov 20-22 the actual load came in about 47 MW above
+    # the expected value at every hour and lead (colder late-November load than the training years); +30 MW, checked
+    # on Nov 23-24, raised CRPS skill from about 75% to 78%. card "level_shift_mw" (0 or missing = off).
+    level = float(card.get("level_shift_mw", 0.0))
+    low, expected, high = low + level, expected + level, high + level
     return low, expected, high
 
 
