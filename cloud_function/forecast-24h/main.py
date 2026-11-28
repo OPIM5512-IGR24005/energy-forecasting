@@ -364,6 +364,17 @@ def run_once(dry_run: bool = False) -> dict:
     if len(coast) > 0:
         weather = weather.join(coast, how="left")
     X = make_features(targets, weather, load)
+    # Tomato (Nov 28): "same hour last week" is a bad guide when last week was a holiday. For target hours whose day
+    # one week earlier is listed in card "lastweek_skip_local_dates" (Thanksgiving Nov 26 and Black Friday Nov 27),
+    # use the same hour TWO weeks earlier instead. Checked on 2023-2025: the Thursday after Thanksgiving's average
+    # miss fell from ~108 to ~77 MW (better in all 3 years); Friday ~99 to ~90 MW.
+    skip_days = card.get("lastweek_skip_local_dates", [])
+    if skip_days:
+        week_ago_day = (targets - pd.Timedelta(hours=168)).tz_convert("America/New_York").strftime("%Y-%m-%d")
+        swap = np.asarray(pd.Index(week_ago_day).isin(skip_days))
+        if swap.any():
+            two_weeks = load.reindex(targets[swap] - pd.Timedelta(hours=336)).values
+            X.loc[X.index[swap], "load_lastweek_mw"] = np.where(np.isnan(two_weeks), X.loc[X.index[swap], "load_lastweek_mw"].values, two_weeks)
 
     # Honest gap filling (rare): a missing weather value takes its neighbor; a missing yesterday load takes the newest load
     filled_weather = int(X[WEATHER].isna().sum().sum())
